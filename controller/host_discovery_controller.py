@@ -7,6 +7,7 @@ This application performs three main tasks:
 """
 
 from datetime import datetime
+from ryu.lib import hub
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
@@ -26,6 +27,8 @@ class HostDiscoveryController(app_manager.RyuApp):
         super(HostDiscoveryController, self).__init__(*args, **kwargs)
         self.mac_to_port = {}
         self.host_db = {}
+        self.inactivity_timeout = 10
+        self.monitor_thread = hub.spawn(self._monitor_host_status)
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
         """Install a flow entry using explicit OpenFlow match-action logic."""
@@ -80,24 +83,84 @@ class HostDiscoveryController(app_manager.RyuApp):
             "switch": dpid,
             "port": in_port,
             "last_seen": timestamp,
+            "status": "ONLINE",
         }
 
         if known_host is None:
-            self.logger.info(
-                "New host detected: mac=%s, switch=%s, port=%s",
-                src_mac,
-                dpid,
-                in_port,
-            )
-        elif known_host["port"] != in_port or known_host["switch"] != dpid:
-            self.logger.info(
-                "Host location updated: mac=%s, switch=%s, port=%s",
-                src_mac,
-                dpid,
-                in_port,
-            )
+            self.logger.info("NEW HOST JOINED: %s -> ONLINE", src_mac)
+        else:
+            self.logger.info("HOST STATUS UPDATE: %s -> ONLINE", src_mac)
 
-        self.logger.info("Current host database: %s", self.host_db)
+            if known_host["port"] != in_port or known_host["switch"] != dpid:
+                self.logger.info(
+                    "Host location updated: mac=%s, switch=%s, port=%s",
+                    src_mac,
+                    dpid,
+                    in_port,
+                )
+
+        self.log_host_database()
+
+    # Status tracking: print a clean snapshot whenever host state changes.
+    def log_host_database(self):
+        self.logger.info("## HOST DATABASE")
+        self.logger.info("")
+        self.logger.info("%-18s %-8s %s", "MAC ADDRESS", "STATUS", "PORT")
+        for mac, details in sorted(self.host_db.items()):
+            self.logger.info(
+                "%-18s %-8s %s",
+                mac,
+                details["status"],
+                details["port"],
+            )
+        self.logger.info("--------------------------------")
+
+    # Status tracking: mark idle hosts OFFLINE after the inactivity timeout.
+    def _monitor_host_status(self):
+        while True:
+            now = datetime.now()
+            database_changed = False
+
+            for mac, details in self.host_db.items():
+                last_seen = datetime.strptime(details["last_seen"], "%Y-%m-%d %H:%M:%S")
+                if (
+                    details["status"] == "ONLINE"
+                    and (now - last_seen).total_seconds() > self.inactivity_timeout
+                ):
+                    details["status"] = "OFFLINE"
+                    self.logger.info("HOST STATUS UPDATE: %s -> OFFLINE", mac)
+                    database_changed = True
+
+            if database_changed:
+                self.log_host_database()
+
+            hub.sleep(1)
+
+    # Status tracking: immediately mark hosts OFFLINE when their switch port goes down.
+    @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
+    def port_status_handler(self, ev):
+        msg = ev.msg
+        reason = msg.reason
+        port_no = msg.desc.port_no
+        dpid = format(msg.datapath.id, "016x")
+        ofproto = msg.datapath.ofproto
+
+        is_port_down = reason == ofproto.OFPPR_DELETE
+        if reason == ofproto.OFPPR_MODIFY:
+            is_port_down = bool(msg.desc.state & ofproto.OFPPS_LINK_DOWN)
+
+        if not is_port_down:
+            return
+
+        database_changed = False
+        for mac, details in self.host_db.items():
+            if details["switch"] == dpid and details["port"] == port_no and details["status"] != "OFFLINE":
+                details["status"] = "OFFLINE"
+                self.logger.info("HOST DISCONNECTED: %s -> OFFLINE", mac)
+                database_changed = True
+
+        if database_changed:
+            self.log_host_database()
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
